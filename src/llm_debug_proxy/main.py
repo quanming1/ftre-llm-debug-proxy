@@ -620,22 +620,131 @@ class ProxySettings:
 
     def __post_init__(self) -> None:
         self.upstream_base = self.upstream_base.rstrip("/")
-        self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.audit = AuditLog(self.log_dir)
+        self.db_path = (self.log_dir / "proxy.db") if (self.log_dir.is_dir() or not self.log_dir.suffix) else self.log_dir
+        self.store = Store(self.db_path)
 
 
-class AuditLog:
-    def __init__(self, log_dir: Path):
-        self.log_dir = log_dir
+class Store:
+    """SQLite-based storage."""
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
         self._lock = asyncio.Lock()
+        self._init_db()
 
-    async def write(self, event: dict[str, Any]) -> None:
-        event = {"ts": datetime.now().isoformat(timespec="milliseconds"), **event}
-        path = self.log_dir / f"llm-proxy-{datetime.now():%Y%m%d}.jsonl"
-        line = json.dumps(event, ensure_ascii=False, default=str)
+    def _init_db(self):
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        import sqlite3
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS requests (
+                    id TEXT PRIMARY KEY, source TEXT, ts TEXT, method TEXT, path TEXT,
+                    model TEXT, stream INTEGER,
+                    message_count INTEGER DEFAULT 0, tool_count INTEGER DEFAULT 0,
+                    messages TEXT, tools TEXT,
+                    max_tokens INTEGER, temperature REAL, status_code INTEGER,
+                    finish_reasons TEXT, elapsed_ms REAL, error TEXT,
+                    request_body TEXT, response_body TEXT
+                )
+            """)
+            # Migration: add columns if missing
+            try:
+                conn.execute("ALTER TABLE requests ADD COLUMN message_count INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            try:
+                conn.execute("ALTER TABLE requests ADD COLUMN tool_count INTEGER DEFAULT 0")
+            except Exception:
+                pass
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id TEXT NOT NULL, type TEXT, data TEXT, ts TEXT,
+                    FOREIGN KEY (request_id) REFERENCES requests(id)
+                )
+            """)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_request ON events(request_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts DESC)")
+
+    async def write_request(self, rid, source, ts, method, path, model, stream, messages, tools, max_tokens, temperature, request_body):
+        import sqlite3
         async with self._lock:
-            with path.open("a", encoding="utf-8") as fp:
-                fp.write(line + "\n")
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute(
+                    """INSERT OR REPLACE INTO requests (id,source,ts,method,path,model,stream,message_count,tool_count,messages,tools,max_tokens,temperature,request_body) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (rid, source, ts, method, path, model, 1 if stream else 0,
+                     len(messages) if isinstance(messages, list) else 0,
+                     len(tools) if isinstance(tools, list) else 0,
+                     json.dumps(messages, ensure_ascii=False) if messages is not None else None,
+                     json.dumps(tools, ensure_ascii=False) if tools is not None else None,
+                     max_tokens, temperature,
+                     json.dumps(request_body, ensure_ascii=False, default=str) if request_body else None))
+
+    async def write_response(self, rid, status_code, finish_reasons, elapsed_ms, error, response_body):
+        import sqlite3
+        async with self._lock:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute(
+                    "UPDATE requests SET status_code=?,finish_reasons=?,elapsed_ms=?,error=?,response_body=? WHERE id=?",
+                    (status_code, json.dumps(finish_reasons or []), elapsed_ms, error,
+                     json.dumps(response_body, ensure_ascii=False, default=str) if response_body else None, rid))
+
+    async def write_event(self, rid, event_type, data, ts=None):
+        import sqlite3
+        async with self._lock:
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.execute(
+                    "INSERT INTO events (request_id,type,data,ts) VALUES (?,?,?,?)",
+                    (rid, event_type, json.dumps(data, ensure_ascii=False, default=str),
+                     ts or datetime.now().isoformat(timespec="milliseconds")))
+
+    def list_requests(self, limit=200, source="", query=""):
+        import sqlite3
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            where, params = [], []
+            if source:
+                where.append("source = ?"); params.append(source)
+            if query:
+                where.append("(model LIKE ? OR id LIKE ?)"); params.extend([f"%{query}%", f"%{query}%"])
+            sql = "SELECT id, source, ts, method, path, model, stream, message_count, tool_count, status_code, finish_reasons, elapsed_ms, error FROM requests"
+            if where: sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY ts DESC LIMIT ?"; params.append(limit)
+            rows = conn.execute(sql, params).fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                item["request_id"] = item.pop("id")
+                item["finish_reasons"] = json.loads(item.get("finish_reasons") or "[]")
+                item["stream"] = bool(item.get("stream"))
+                result.append(item)
+            return result
+
+    def get_request(self, request_id):
+        import sqlite3
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()
+            if not row: return None
+            item = dict(row)
+            item["request_id"] = item.pop("id")
+            item["finish_reasons"] = json.loads(item.get("finish_reasons") or "[]")
+            item["stream"] = bool(item.get("stream"))
+            item["messages"] = json.loads(item.get("messages") or "[]")
+            item["tools"] = json.loads(item.get("tools") or "[]")
+            item["request_body"] = safe_json_loads(item.get("request_body") or "{}")
+            item["response_body"] = safe_json_loads(item.get("response_body") or "{}")
+            item["message_count"] = len(item["messages"])
+            item["tool_count"] = len(item["tools"])
+            events = conn.execute("SELECT * FROM events WHERE request_id = ? ORDER BY ts", (request_id,)).fetchall()
+            item["events"] = [json.loads(e["data"]) for e in events]
+            return item
+
+    def get_sources(self):
+        import sqlite3
+        with sqlite3.connect(str(self.db_path)) as conn:
+            rows = conn.execute("SELECT DISTINCT source FROM requests WHERE source IS NOT NULL ORDER BY source").fetchall()
+            return [r[0] for r in rows]
 
 
 def create_app(settings: ProxySettings) -> FastAPI:
@@ -643,7 +752,10 @@ def create_app(settings: ProxySettings) -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
-        return LOG_VIEWER_HTML
+        index_path = Path(__file__).parent.parent.parent / "viewer" / "dist" / "index.html"
+        if index_path.exists():
+            return index_path.read_text(encoding="utf-8")
+        return LOG_VIEWER_HTML  # fallback
 
     @app.get("/health")
     async def health() -> dict[str, Any]:
@@ -655,23 +767,27 @@ def create_app(settings: ProxySettings) -> FastAPI:
 
     @app.get("/api/logs")
     async def api_logs(limit: int = 200, source: str = "", q: str = "") -> dict[str, Any]:
-        events = read_log_events(settings.log_dir, limit=max(1, min(limit, 2000)))
-        sessions = summarize_requests(events)
-        if source:
-            sessions = [item for item in sessions if item.get("source") == source]
-        if q:
-            needle = q.lower()
-            sessions = [
-                item
-                for item in sessions
-                if needle in json.dumps(item, ensure_ascii=False, default=str).lower()
-            ]
+        sessions = settings.store.list_requests(limit=limit, source=source, query=q)
+        sources_list = settings.store.get_sources()
         return {
-            "log_dir": str(settings.log_dir),
-            "files": [path.name for path in list_log_files(settings.log_dir)],
-            "sources": sorted({str(item.get("source") or "") for item in sessions if item.get("source")}),
+            "log_dir": str(settings.db_path),
+            "files": [],
+            "sources": sources_list,
             "sessions": sessions,
         }
+
+    @app.get("/api/logs/{request_id}")
+    async def api_log_detail(request_id: str) -> dict[str, Any]:
+        session = settings.store.get_request(request_id)
+        return {"session": session}
+
+    @app.get("/assets/{path:path}")
+    async def assets(path: str):
+        from fastapi.responses import FileResponse as FR
+        asset_path = Path(__file__).parent.parent.parent / "viewer" / "dist" / "assets" / path
+        if asset_path.exists():
+            return FR(asset_path)
+        return Response(status_code=404)
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     async def proxy(path: str, request: Request):
@@ -688,8 +804,16 @@ def create_app(settings: ProxySettings) -> FastAPI:
             "user-agent", "unknown"
         )
 
-        await settings.audit.write(
-            build_request_event(request_id, source, request, path, request_json, body)
+        ts = datetime.now().isoformat(timespec="milliseconds")
+        await settings.store.write_request(
+            request_id, source, ts, request.method, path,
+            request_json.get("model") if isinstance(request_json, dict) else None,
+            request_json.get("stream") if isinstance(request_json, dict) else None,
+            request_json.get("messages") if isinstance(request_json, dict) else None,
+            request_json.get("tools") if isinstance(request_json, dict) else None,
+            request_json.get("max_tokens") if isinstance(request_json, dict) else None,
+            request_json.get("temperature") if isinstance(request_json, dict) else None,
+            request_json if isinstance(request_json, dict) else None,
         )
 
         upstream_url = build_upstream_url(settings.upstream_base, path, request.url.query)
@@ -706,14 +830,10 @@ def create_app(settings: ProxySettings) -> FastAPI:
             upstream = await stream_cm.__aenter__()
         except Exception as exc:
             await client.aclose()
-            await settings.audit.write(
-                {
-                    "type": "proxy_error",
-                    "request_id": request_id,
-                    "source": source,
-                    "error": repr(exc),
-                    "elapsed_ms": elapsed_ms(started),
-                }
+            await settings.store.write_event(
+                request_id, "proxy_error",
+                {"error": repr(exc), "elapsed_ms": elapsed_ms(started)},
+                datetime.now().isoformat(timespec="milliseconds"),
             )
             raise
 
@@ -743,36 +863,25 @@ def create_app(settings: ProxySettings) -> FastAPI:
                 async for chunk in upstream.aiter_bytes():
                     for reason in parser.feed(chunk):
                         finish_reasons.append(reason)
-                        await settings.audit.write(
-                            {
-                                "type": "finish_reason",
-                                "request_id": request_id,
-                                "source": source,
-                                "finish_reason": reason,
-                            }
+                        await settings.store.write_event(
+                            request_id, "finish_reason",
+                            {"finish_reason": reason, "source": source},
+                            datetime.now().isoformat(timespec="milliseconds"),
                         )
                     yield chunk
                 for reason in parser.close():
                     finish_reasons.append(reason)
-                    await settings.audit.write(
-                        {
-                            "type": "finish_reason",
-                            "request_id": request_id,
-                            "source": source,
-                            "finish_reason": reason,
-                        }
+                    await settings.store.write_event(
+                        request_id, "finish_reason",
+                        {"finish_reason": reason, "source": source},
+                        datetime.now().isoformat(timespec="milliseconds"),
                     )
             finally:
-                await settings.audit.write(
-                    {
-                        "type": "response_complete",
-                        "request_id": request_id,
-                        "source": source,
-                        "status_code": upstream.status_code,
-                        "finish_reasons": finish_reasons,
-                        "saw_stop": "stop" in finish_reasons,
-                        "elapsed_ms": elapsed_ms(started),
-                    }
+                await settings.store.write_event(
+                    request_id, "response_complete",
+                    {"status_code": upstream.status_code, "finish_reasons": finish_reasons,
+                     "elapsed_ms": elapsed_ms(started), "source": source},
+                    datetime.now().isoformat(timespec="milliseconds"),
                 )
                 await upstream.aclose()
                 await stream_cm.__aexit__(None, None, None)
@@ -827,40 +936,6 @@ def extract_finish_reasons_from_lines(lines: list[str]) -> list[str]:
     return reasons
 
 
-def build_request_event(
-    request_id: str,
-    source: str,
-    request: Request,
-    path: str,
-    request_json: Any,
-    body: bytes,
-) -> dict[str, Any]:
-    event: dict[str, Any] = {
-        "type": "request",
-        "request_id": request_id,
-        "source": source,
-        "method": request.method,
-        "path": "/" + path,
-        "query": str(request.url.query),
-        "client": request.client.host if request.client else None,
-    }
-    if isinstance(request_json, dict):
-        event.update(
-            {
-                "model": request_json.get("model"),
-                "stream": request_json.get("stream"),
-                "messages": request_json.get("messages"),
-                "tools": request_json.get("tools"),
-                "tool_choice": request_json.get("tool_choice"),
-                "max_tokens": request_json.get("max_tokens"),
-                "temperature": request_json.get("temperature"),
-            }
-        )
-    else:
-        event["body_bytes"] = len(body)
-    return event
-
-
 def build_upstream_url(upstream_base: str, path: str, query: str) -> str:
     base = upstream_base.rstrip("/")
     clean_path = path.lstrip("/")
@@ -892,6 +967,13 @@ def filter_response_headers(headers) -> dict[str, str]:
     return {key: value for key, value in headers.items() if key.lower() not in blocked}
 
 
+def safe_json_loads(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
+
+
 def decode_json(body: bytes) -> Any:
     if not body:
         return None
@@ -915,18 +997,10 @@ async def log_non_stream_response(
         for choice in payload.get("choices") or []:
             if isinstance(choice, dict) and choice.get("finish_reason"):
                 finish_reasons.append(str(choice["finish_reason"]))
-    await settings.audit.write(
-        {
-            "type": "response_complete",
-            "request_id": request_id,
-            "source": source,
-            "status_code": status_code,
-            "finish_reasons": finish_reasons,
-            "saw_stop": "stop" in finish_reasons,
-            "response_json": payload if isinstance(payload, dict) else None,
-            "response_bytes": len(data),
-            "elapsed_ms": elapsed_ms(started),
-        }
+    await settings.store.write_response(
+        request_id, status_code, finish_reasons, elapsed_ms(started),
+        None,
+        payload if isinstance(payload, dict) else None,
     )
 
 
